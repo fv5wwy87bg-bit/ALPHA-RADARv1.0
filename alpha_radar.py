@@ -15,9 +15,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from signal_store import evaluate_due_outcomes, print_outcome_report, record_observations
+
 SPOT_API = "https://api.binance.com"
 FUTURES_API = "https://fapi.binance.com"
-STATE_FILE = Path(os.getenv("STATE_FILE", "radar_state.json"))
 EXCLUDED_BASES = {"USDC", "FDUSD", "TUSD", "USDP", "DAI", "USDE", "USTC", "EUR"}
 log = logging.getLogger("alpha_radar")
 
@@ -78,16 +79,18 @@ def score_signal(
 
 
 def load_state() -> dict[str, Any]:
+    state_file = Path(os.getenv("STATE_FILE", "radar_state.json"))
     try:
-        return json.loads(STATE_FILE.read_text())
+        return json.loads(state_file.read_text())
     except (OSError, json.JSONDecodeError):
         return {"open_interest": {}, "alerts": {}}
 
 
 def save_state(state: dict[str, Any]) -> None:
-    temporary = STATE_FILE.with_suffix(".tmp")
+    state_file = Path(os.getenv("STATE_FILE", "radar_state.json"))
+    temporary = state_file.with_suffix(".tmp")
     temporary.write_text(json.dumps(state, indent=2))
-    temporary.replace(STATE_FILE)
+    temporary.replace(state_file)
 
 
 def eligible_symbols() -> set[str]:
@@ -173,8 +176,8 @@ def format_signal(item: dict[str, Any]) -> str:
 
 
 def run_scan() -> list[dict[str, Any]]:
-    limit = int(os.getenv("MAX_SYMBOLS", "50"))
-    limit = int(clamp(limit, 1, 100))
+    limit = int(os.getenv("MAX_SYMBOLS", "100"))
+    limit = int(clamp(limit, 1, 200))
     min_volume = float(os.getenv("MIN_24H_QUOTE_VOLUME", "10000000"))
     alert_score = int(clamp(int(os.getenv("ALERT_SCORE", "65")), 0, 100))
     state = load_state()
@@ -214,12 +217,17 @@ def run_scan() -> list[dict[str, Any]]:
 
     results.sort(key=lambda item: item["score"], reverse=True)
     print(f"\nScan {datetime.now(timezone.utc).isoformat(timespec='seconds')} UTC — {len(results)} pairs")
-    for item in results[:15]:
+    for item in results[:10]:
         print(format_signal(item))
+
+    database = os.getenv("RADAR_DB", "radar_history.sqlite3")
+    observed_at = time.time()
+    record_observations(results, database, observed_at)
+    evaluate_due_outcomes(database, observed_at)
 
     previous_alerts: dict[str, float] = state.get("alerts", {})
     now = time.time()
-    for item in results:
+    for item in results[:10]:
         symbol = item["symbol"]
         was_above = float(previous_alerts.get(symbol, 0)) >= alert_score
         last_alert_at = float(previous_alerts.get(f"{symbol}:sent_at", 0))
@@ -243,7 +251,11 @@ def main() -> None:
     logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(message)s")
     parser = argparse.ArgumentParser(description="Scan liquid Binance USDT spot/perpetual pairs.")
     parser.add_argument("--once", action="store_true", help="run one scan and exit")
+    parser.add_argument("--report", action="store_true", help="summarize completed forward outcomes and exit")
     args = parser.parse_args()
+    if args.report:
+        print_outcome_report(os.getenv("RADAR_DB", "radar_history.sqlite3"))
+        return
     interval = max(60, int(os.getenv("SCAN_INTERVAL_SECONDS", "600")))
     while True:
         try:
