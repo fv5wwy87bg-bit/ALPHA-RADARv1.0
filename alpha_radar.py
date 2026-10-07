@@ -54,18 +54,24 @@ def score_signal(
     volume_ratio: float,
     oi_change_pct: float | None,
     funding_rate: float | None,
+    taker_buy_imbalance: float | None = None,
 ) -> dict[str, Any]:
     """Return an explainable 0-100 ranking score and its component points."""
     momentum = clamp(price_change_1h_pct * 10, 0, 30)
     volume = clamp((volume_ratio - 1) * 15, 0, 25)
     oi = 0.0
     if oi_change_pct is not None and price_change_1h_pct > 0:
-        oi = clamp(oi_change_pct * 7.5, 0, 20)
-    agreement = 25.0 if price_change_1h_pct > 0 and oi_change_pct is not None and oi_change_pct > 0 else 0.0
+        oi = clamp(oi_change_pct * 5, 0, 15)
+    agreement = 20.0 if price_change_1h_pct > 0 and oi_change_pct is not None and oi_change_pct > 0 else 0.0
+    taker_flow = 0.0
+    if taker_buy_imbalance is not None:
+        # Positive imbalance means taker buys exceeded taker sells. This is
+        # spot trade pressure, not exchange wallet inflow/outflow or CVD.
+        taker_flow = clamp(taker_buy_imbalance * 20, 0, 10)
     funding_penalty = 0.0
     if funding_rate is not None:
         funding_penalty = clamp((funding_rate - 0.0002) * 20_000, 0, 20)
-    score = round(clamp(momentum + volume + oi + agreement - funding_penalty, 0, 100))
+    score = round(clamp(momentum + volume + oi + agreement + taker_flow - funding_penalty, 0, 100))
     return {
         "score": score,
         "components": {
@@ -73,6 +79,7 @@ def score_signal(
             "volume_expansion": round(volume, 1),
             "open_interest": round(oi, 1),
             "price_oi_agreement": round(agreement, 1),
+            "spot_taker_buy_pressure": round(taker_flow, 1),
             "funding_penalty": round(funding_penalty, 1),
         },
     }
@@ -126,17 +133,28 @@ def scan_symbol(symbol: str, prior_oi: dict[str, float], funding: dict[str, floa
     baseline = sum(float(candle[7]) for candle in closed[-21:-1]) / 20
     volume_ratio = last_quote_volume / baseline if baseline > 0 else 0.0
 
+    # Binance kline field 10 is quote volume bought by taker orders.
+    # Compare it with all quote volume in the latest 12 closed 5m candles.
+    recent_hour = closed[-12:]
+    recent_quote_volume = sum(float(candle[7]) for candle in recent_hour)
+    recent_taker_buy_quote = sum(float(candle[10]) for candle in recent_hour)
+    taker_buy_imbalance = (
+        2 * recent_taker_buy_quote / recent_quote_volume - 1
+        if recent_quote_volume > 0 else 0.0
+    )
+
     oi_payload = get_json(f"{FUTURES_API}/fapi/v1/openInterest", params={"symbol": symbol})
     current_oi = float(oi_payload["openInterest"])
     previous = prior_oi.get(symbol)
     oi_change = ((current_oi / previous) - 1) * 100 if previous and previous > 0 else None
     rate = funding.get(symbol)
-    scored = score_signal(price_change, volume_ratio, oi_change, rate)
+    scored = score_signal(price_change, volume_ratio, oi_change, rate, taker_buy_imbalance)
     return {
         "symbol": symbol,
         "price": last_close,
         "price_change_1h_pct": price_change,
         "spot_volume_ratio": volume_ratio,
+        "spot_taker_buy_imbalance_1h": taker_buy_imbalance,
         "open_interest": current_oi,
         "oi_change_pct": oi_change,
         "funding_rate": rate,
@@ -167,11 +185,13 @@ def telegram_send(text: str) -> None:
 def format_signal(item: dict[str, Any]) -> str:
     oi = "baseline" if item["oi_change_pct"] is None else f'{item["oi_change_pct"]:+.2f}%'
     funding = "n/a" if item["funding_rate"] is None else f'{item["funding_rate"] * 100:+.4f}%'
+    buy_pressure = item.get("spot_taker_buy_imbalance_1h")
+    buy_pressure_text = "n/a" if buy_pressure is None else f'{buy_pressure * 100:+.1f}%'
     return (
         f'{item["symbol"]}  score {item["score"]}/100 | '
         f'1h {item["price_change_1h_pct"]:+.2f}% | '
         f'5m spot volume {item["spot_volume_ratio"]:.2f}x baseline | '
-        f'OI {oi} | funding {funding}'
+        f'OI {oi} | taker buy imbalance 1h {buy_pressure_text} | funding {funding}'
     )
 
 
